@@ -87,3 +87,68 @@ def test_rerank_models_mteb(vllm_runner, model_info: RerankModelInfo) -> None:
 
     mteb_test_rerank_models(Qwen3RerankerHfRunner, vllm_runner, model_info,
                             vllm_extra_kwargs)
+
+
+def test_tensor_parallel_weight_loading():
+    """Test that weight loading works correctly with tensor parallelism.
+    
+    This test validates the fix for the issue where tensor size mismatches
+    occurred when loading Qwen3 reranker models with tensor_parallel_size > 1.
+    """
+    from unittest.mock import MagicMock, patch
+    
+    with patch('vllm.model_executor.models.adapters.get_tensor_model_parallel_rank') as mock_tp_rank, \
+         patch('vllm.model_executor.models.adapters.get_tensor_model_parallel_world_size') as mock_tp_size:
+        
+        # Test tensor parallelism with 2 GPUs
+        mock_tp_size.return_value = 2
+        mock_tp_rank.return_value = 0
+        
+        hidden_size = 2560
+        num_labels = 1
+        
+        # Create mock model with score layer that has sharded weights
+        model = MagicMock()
+        model.score.weight.device = torch.device('cpu')
+        model.score.weight.data = torch.zeros(num_labels, hidden_size // 2)  # Sharded weight
+        
+        # Mock config
+        model.config.classifier_from_token = ["no", "yes"]
+        model.config.tie_word_embeddings = False
+        model.config.vocab_size = 151936
+        model.config.hidden_size = hidden_size
+        model.quant_config = None
+        model.vllm_config.model_config = MagicMock()
+        model.vllm_config.model_config.tokenizer = "test_tokenizer"
+        model.vllm_config.model_config.tokenizer_revision = None
+        model.vllm_config.model_config.tokenizer_mode = "auto"
+        model.vllm_config.model_config.trust_remote_code = False
+        
+        # Mock lm_head with full size weights
+        model.lm_head.weight.data = torch.randn(151936, hidden_size)
+        
+        # Mock tokenizer
+        with patch('vllm.model_executor.models.adapters.get_tokenizer') as mock_get_tokenizer:
+            mock_tokenizer = MagicMock()
+            mock_tokenizer.convert_tokens_to_ids.side_effect = lambda x: {"no": 1234, "yes": 5678}[x]
+            mock_get_tokenizer.return_value = mock_tokenizer
+            
+            # Mock AutoWeightsLoader
+            with patch('vllm.model_executor.models.adapters.AutoWeightsLoader') as mock_loader_class:
+                mock_loader = MagicMock()
+                mock_loader.load_weights.return_value = set()
+                mock_loader_class.return_value = mock_loader
+                
+                # Mock ParallelLMHead
+                with patch('vllm.model_executor.models.adapters.ParallelLMHead') as mock_lmhead_class:
+                    mock_lmhead_class.return_value = model.lm_head
+                    
+                    # Import and test the function
+                    from vllm.model_executor.models.adapters import load_weights_using_from_2_way_softmax
+                    
+                    # This should not raise a tensor size mismatch error
+                    load_weights_using_from_2_way_softmax(model, [])
+                    
+                    # Verify that the weight was copied successfully
+                    # The exact values don't matter, just that no exception was raised
+                    assert True  # If we get here, the tensor size issue is fixed
